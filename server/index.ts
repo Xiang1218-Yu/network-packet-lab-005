@@ -1,12 +1,22 @@
 import express, { type Request, type Response } from 'express';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type {
+  CaptureFrame,
+  CaptureSummary,
+  FieldMarker,
   HexRow,
+  MarkerAnchor,
+  MarkerColor,
   PacketScenario,
   ParseRequest,
   Protocol,
   ProtocolField,
+  SaveCaptureRequest,
   SimulatedPacket,
-  TimelineEvent
+  TimelineEvent,
+  UpdateMarkersRequest
 } from '../shared/types.js';
 
 const app = express();
@@ -16,7 +26,7 @@ app.use(express.json({ limit: '1mb' }));
 app.use((request, response, next) => {
   response.header('Access-Control-Allow-Origin', '*');
   response.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
-  response.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  response.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
   if (request.method === 'OPTIONS') return response.sendStatus(204);
   next();
 });
@@ -160,6 +170,107 @@ function buildPacket(protocol: Protocol, scenario: PacketScenario, raw: string):
 function isProtocol(value: unknown): value is Protocol { return value === 'HTTP' || value === 'TCP'; }
 function isScenario(value: unknown): value is PacketScenario { return value === 'request' || value === 'response' || value === 'handshake'; }
 
+/* ------------------------------------------------------------------ */
+/* Capture frame store: packets persisted together with their markers  */
+/* ------------------------------------------------------------------ */
+
+const DATA_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'data');
+const STORE_FILE = path.join(DATA_DIR, 'captures.json');
+
+const MARKER_COLORS: MarkerColor[] = ['teal', 'amber', 'rose', 'violet', 'sky'];
+
+function isMarkerAnchor(value: unknown): value is MarkerAnchor {
+  if (!value || typeof value !== 'object') return false;
+  const anchor = value as Record<string, unknown>;
+  if (anchor.kind === 'field') {
+    return Array.isArray(anchor.path)
+      && anchor.path.every((id) => typeof id === 'string' && id.length > 0)
+      && typeof anchor.fieldKey === 'string'
+      && typeof anchor.fieldValue === 'string';
+  }
+  if (anchor.kind === 'bytes') {
+    return Number.isInteger(anchor.start)
+      && Number.isInteger(anchor.end)
+      && (anchor.start as number) >= 0
+      && (anchor.end as number) > (anchor.start as number)
+      && typeof anchor.sample === 'string';
+  }
+  return false;
+}
+
+function sanitizeMarkers(value: unknown): FieldMarker[] {
+  if (!Array.isArray(value)) return [];
+  const now = new Date().toISOString();
+  const markers: FieldMarker[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object') continue;
+    const candidate = item as Partial<FieldMarker>;
+    if (typeof candidate.id !== 'string' || !candidate.id.trim()) continue;
+    if (!isMarkerAnchor(candidate.anchor)) continue;
+    markers.push({
+      id: candidate.id,
+      anchor: candidate.anchor,
+      color: MARKER_COLORS.includes(candidate.color as MarkerColor) ? candidate.color as MarkerColor : 'amber',
+      note: typeof candidate.note === 'string' ? candidate.note.slice(0, 2000) : '',
+      createdAt: typeof candidate.createdAt === 'string' ? candidate.createdAt : now,
+      updatedAt: typeof candidate.updatedAt === 'string' ? candidate.updatedAt : now
+    });
+  }
+  return markers;
+}
+
+function isStorablePacket(value: unknown): value is SimulatedPacket {
+  if (!value || typeof value !== 'object') return false;
+  const packet = value as Partial<SimulatedPacket>;
+  return typeof packet.id === 'string'
+    && isProtocol(packet.protocol)
+    && isScenario(packet.scenario)
+    && typeof packet.raw === 'string'
+    && Array.isArray(packet.fields)
+    && Array.isArray(packet.hex)
+    && Boolean(packet.metadata) && typeof packet.metadata === 'object';
+}
+
+function loadCaptures(): CaptureFrame[] {
+  try {
+    if (!existsSync(STORE_FILE)) return [];
+    const parsed = JSON.parse(readFileSync(STORE_FILE, 'utf8')) as { captures?: CaptureFrame[] };
+    if (!Array.isArray(parsed?.captures)) return [];
+    return parsed.captures.filter((capture) => isStorablePacket(capture?.packet)).map((capture) => ({
+      ...capture,
+      markers: sanitizeMarkers(capture.markers)
+    }));
+  } catch {
+    return [];
+  }
+}
+
+let captures: CaptureFrame[] = loadCaptures();
+
+function persistCaptures(): void {
+  mkdirSync(DATA_DIR, { recursive: true });
+  const tempFile = `${STORE_FILE}.tmp`;
+  writeFileSync(tempFile, JSON.stringify({ captures }, null, 2));
+  renameSync(tempFile, STORE_FILE);
+}
+
+function toSummary(capture: CaptureFrame): CaptureSummary {
+  return {
+    id: capture.id,
+    savedAt: capture.savedAt,
+    updatedAt: capture.updatedAt,
+    protocol: capture.packet.protocol,
+    scenario: capture.packet.scenario,
+    summary: capture.packet.summary,
+    length: capture.packet.metadata?.length ?? 0,
+    markerCount: capture.markers.length
+  };
+}
+
+function findCapture(id: string): CaptureFrame | undefined {
+  return captures.find((capture) => capture.id === id);
+}
+
 app.get('/api/health', (_request, response) => response.json({ ok: true, service: 'network-packet-lab-api' }));
 
 app.get('/api/simulate', (request, response) => {
@@ -180,6 +291,72 @@ app.post('/api/parse', (request: Request<unknown, unknown, Partial<ParseRequest>
   const raw = typeof request.body?.raw === 'string' ? request.body.raw : '';
   if (!raw.trim()) return response.status(400).json({ error: 'raw is required' });
   response.json({ data: buildPacket(protocol, scenario, raw) });
+});
+
+app.get('/api/captures', (_request, response) => {
+  const summaries = captures.map(toSummary).sort((a, b) => b.savedAt.localeCompare(a.savedAt));
+  response.json({ data: summaries });
+});
+
+app.post('/api/captures', (request: Request<unknown, unknown, Partial<SaveCaptureRequest>>, response: Response) => {
+  if (!isStorablePacket(request.body?.packet)) {
+    return response.status(400).json({ error: 'a valid packet is required' });
+  }
+  const now = new Date().toISOString();
+  const capture: CaptureFrame = {
+    id: `cap-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+    savedAt: now,
+    updatedAt: now,
+    packet: request.body.packet,
+    markers: sanitizeMarkers(request.body.markers)
+  };
+  captures.push(capture);
+  persistCaptures();
+  response.status(201).json({ data: capture });
+});
+
+app.get('/api/captures/:id', (request, response) => {
+  const capture = findCapture(request.params.id);
+  if (!capture) return response.status(404).json({ error: 'capture not found' });
+  response.json({ data: capture });
+});
+
+app.put('/api/captures/:id', (request: Request<{ id: string }, unknown, Partial<SaveCaptureRequest>>, response: Response) => {
+  const capture = findCapture(request.params.id);
+  if (!capture) return response.status(404).json({ error: 'capture not found' });
+  if (request.body?.packet !== undefined && !isStorablePacket(request.body.packet)) {
+    return response.status(400).json({ error: 'a valid packet is required' });
+  }
+  if (request.body?.packet) capture.packet = request.body.packet;
+  if (request.body?.markers !== undefined) capture.markers = sanitizeMarkers(request.body.markers);
+  capture.updatedAt = new Date().toISOString();
+  persistCaptures();
+  response.json({ data: capture });
+});
+
+app.put('/api/captures/:id/markers', (request: Request<{ id: string }, unknown, Partial<UpdateMarkersRequest>>, response: Response) => {
+  const capture = findCapture(request.params.id);
+  if (!capture) return response.status(404).json({ error: 'capture not found' });
+  capture.markers = sanitizeMarkers(request.body?.markers);
+  capture.updatedAt = new Date().toISOString();
+  persistCaptures();
+  response.json({ data: capture.markers });
+});
+
+app.delete('/api/captures/:id', (request, response) => {
+  const index = captures.findIndex((capture) => capture.id === request.params.id);
+  if (index === -1) return response.status(404).json({ error: 'capture not found' });
+  captures.splice(index, 1);
+  persistCaptures();
+  response.sendStatus(204);
+});
+
+app.get('/api/captures/:id/export', (request, response) => {
+  const capture = findCapture(request.params.id);
+  if (!capture) return response.status(404).json({ error: 'capture not found' });
+  response.setHeader('Content-Type', 'application/json; charset=utf-8');
+  response.setHeader('Content-Disposition', `attachment; filename="${capture.id}.json"`);
+  response.send(JSON.stringify({ exportedAt: new Date().toISOString(), capture }, null, 2));
 });
 
 app.listen(port, () => {

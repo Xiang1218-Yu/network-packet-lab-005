@@ -36,7 +36,9 @@ network-packet-lab/
 3. **协议字段树**：HTTP 展示起始行、Header、Payload；TCP 展示 Ethernet、IPv4、TCP 和 Payload 层级，并支持折叠。
 4. **十六进制视图**：以 offset、hex bytes、ASCII 三列展示当前 payload 的 UTF-8 字节。
 5. **传输时间线**：展示抓包、解析、传输层解码和结构化输出等阶段。
-6. **解析 API / 模拟数据 API**：Express 服务提供 `/api/parse`、`/api/simulate`、`/api/packets` 和 `/api/health`。
+6. **字段注释与书签**：在字段树的任意字段（起始行、单个 Header、TCP 层字段、Payload）或十六进制行上点击 ✎，创建带颜色和文字的标记。字段标记锚定真实字段路径并记录 key/value 指纹，字节标记锚定字节范围并记录内容样本；重新解析内容变化时，无法对应的标记会显示为“已失效”，而不会被错误套用到新字段上。切换字段树 / 十六进制视图时标记关联保持不变。
+7. **捕获帧保存与导出**：`保存捕获帧` 将当前数据包连同全部标记持久化到服务端（`server/data/captures.json`），可随时重新载入、继续编辑或导出 JSON。标记编辑先落到本地状态再同步；接口失败时未提交的编辑保留在前端，可一键重试。
+8. **解析 API / 模拟数据 API**：Express 服务提供 `/api/parse`、`/api/simulate`、`/api/packets`、`/api/captures` 和 `/api/health`。
 
 ## 启动方式
 
@@ -92,6 +94,25 @@ curl -X POST 'http://localhost:3001/api/parse' \
 
 ```bash
 curl 'http://localhost:3001/api/packets?protocol=TCP'
+```
+
+### 保存带标记的捕获帧
+
+```bash
+curl -X POST 'http://localhost:3001/api/captures' \
+  -H 'Content-Type: application/json' \
+  -d '{"packet":{...},"markers":[{"id":"mk-1","anchor":{"kind":"field","path":["http-headers","header-0"],"fieldKey":"Host","fieldValue":"lab.local"},"color":"amber","note":"虚拟主机入口","createdAt":"...","updatedAt":"..."}]}'
+```
+
+### 捕获帧管理
+
+```bash
+curl 'http://localhost:3001/api/captures'                      # 列表（含标记数量）
+curl 'http://localhost:3001/api/captures/<id>'                 # 载入完整帧与标记
+curl -X PUT 'http://localhost:3001/api/captures/<id>/markers' \
+  -H 'Content-Type: application/json' -d '{"markers":[...]}'   # 同步标记
+curl -X DELETE 'http://localhost:3001/api/captures/<id>'       # 删除
+curl -OJ 'http://localhost:3001/api/captures/<id>/export'      # 导出 JSON 文件
 ```
 
 ## 说明
